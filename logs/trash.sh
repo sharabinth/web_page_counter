@@ -35,3 +35,22 @@ EOF
 sudo consul connect proxy -sidecar-for redis >${LOG} &
 
 sudo consul connect proxy -service myapp -upstream redis:8888 &
+
+
+
+func getConsulSVC(consulClient consul.Client, key string) net.Conn {
+
+	  	fmt.Printf("Getting this far")
+	
+		// name of _this_ service. The service should be cleaned up via Close.
+		svc, _ := connect.NewService("my-service", &consulClient)
+		defer svc.Close()
+
+		// Connect to the "userinfo" Consul service.
+		conn, _ := svc.Dial(context.Background(), &connect.ConsulResolver{
+			Client: &consulClient,
+			Name:   "redis",
+		})
+
+	return conn
+}

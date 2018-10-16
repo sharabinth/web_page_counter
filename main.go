@@ -12,18 +12,22 @@ import (
 	"strings"
 	"bytes"
 	"time"
+	"net"
+	"context"
 
 	"github.com/DataDog/datadog-go/statsd"
 	"github.com/go-redis/redis"
 	"github.com/gorilla/mux"
 	consul "github.com/hashicorp/consul/api"
 	vault "github.com/hashicorp/vault/api"
+	"github.com/hashicorp/consul/connect"
 )
 
 var templates *template.Template
 var redisClient *redis.Client
 var redisMaster string
 var redisPassword string
+var redisConnection net.Conn
 var goapphealth = "GOOD"
 var consulClient *consul.Client
 var targetPort string
@@ -44,7 +48,7 @@ func main() {
 	targetIP = *ipPtr
 	thisServer, _ = os.Hostname()
 	fmt.Printf("Incoming port number: %s \n", targetPort)
-	redisMaster, redisPassword = redisInit()
+	redisMaster, redisPassword, redisConnection = redisInit()
 
 	if (redisMaster == "0") || (redisPassword == "0") {
 
@@ -163,7 +167,7 @@ func getVaultKV(vaultKey string) string {
 	}
 
 	// Read in the Vault service details from consul
-	vaultService := getConsulSVC(*consulClient, "vault")
+	vaultService, _ := getConsulSVC(*consulClient, "vault")
 	vaultAddress = "http://" + vaultService
 	fmt.Printf("Secret Store Address : >> %v \n", vaultAddress)
 
@@ -176,7 +180,7 @@ func getVaultKV(vaultKey string) string {
 		return "FAIL"
 	}
 
-	approleService := getConsulSVC(*consulClient, "approle")
+	approleService, _ := getConsulSVC(*consulClient, "approle")
 	appRoletoken := getVaultToken(approleService, *appRoleID)
 	fmt.Printf("New Application Token : >> %v \n", appRoletoken)
 
@@ -219,8 +223,9 @@ func getConsulKV(consulClient consul.Client, key string) string {
 	return string(appVar.Value)
 }
 
-func getConsulSVC(consulClient consul.Client, key string) string {
+func getConsulSVC(consulClient consul.Client, key string) (serviceDetails string, serviceConnection net.Conn) {
 
+	
 	var serviceDetail strings.Builder
 	// get handle to catalog service api
 	sd := consulClient.Catalog()
@@ -228,19 +233,35 @@ func getConsulSVC(consulClient consul.Client, key string) string {
 	myService, _, err := sd.Service(key, "", nil)
 	if err != nil {
 		fmt.Printf("Failed to discover Redis Service : e.g. curl -s http://localhost:8500/v1/catalog/service/redis >> %v \n", err)
-		return "0"
+		return "0", nil
 	}
 	serviceDetail.WriteString(string(myService[0].Address))
 	serviceDetail.WriteString(":")
 	serviceDetail.WriteString(strconv.Itoa(myService[0].ServicePort))
 
-	return serviceDetail.String()
+	fmt.Printf("\n\nGot HERE\n\n")
+	fmt.Printf(string(myService[0].ServiceName))
+	fmt.Printf(serviceDetail.String())
+
+	// name of _this_ service. The service should be cleaned up via Close.
+	svc, _ := connect.NewService("my-service", &consulClient)
+	defer svc.Close()
+
+	// Connect to the "userinfo" Consul service.
+	conn, _ := svc.Dial(context.Background(), &connect.ConsulResolver{
+		Client: &consulClient,
+		Name:   key,
+	})
+	fmt.Printf("\n\n %v \n\n", conn)
+	fmt.Printf("\n\nGot HERE finish\n\n")
+	return serviceDetail.String(), conn
 }
 
-func redisInit() (string, string) {
+func redisInit() (string, string, net.Conn) {
 
 	var redisService string
 	var redisPassword string
+	var redisConnection net.Conn
 
 	// Get a new Consul client
 	consulClient, err := consul.NewClient(consul.DefaultConfig())
@@ -250,7 +271,7 @@ func redisInit() (string, string) {
 	}
 
 	redisPassword = getVaultKV("redispassword")
-	redisService = getConsulSVC(*consulClient, "redis")
+	redisService, redisConnection = getConsulSVC(*consulClient, "redis")
 	if redisService == "0" {
 		var serviceDetail strings.Builder
 		redisHost := getConsulKV(*consulClient, "REDIS_MASTER_IP")
@@ -261,7 +282,7 @@ func redisInit() (string, string) {
 		redisService = serviceDetail.String()
 	}
 
-	return redisService, redisPassword
+	return redisService, redisPassword, redisConnection
 
 }
 
