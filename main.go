@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"html/template"
@@ -12,7 +13,6 @@ import (
 	"strings"
 	"bytes"
 	"time"
-	"net"
 	"context"
 
 	"github.com/DataDog/datadog-go/statsd"
@@ -27,7 +27,7 @@ var templates *template.Template
 var redisClient *redis.Client
 var redisMaster string
 var redisPassword string
-var redisConnection net.Conn
+var redisTLSConfig *tls.Config
 var goapphealth = "GOOD"
 var consulClient *consul.Client
 var targetPort string
@@ -48,7 +48,7 @@ func main() {
 	targetIP = *ipPtr
 	thisServer, _ = os.Hostname()
 	fmt.Printf("Incoming port number: %s \n", targetPort)
-	redisMaster, redisPassword, redisConnection = redisInit()
+	redisMaster, redisPassword, redisTLSConfig = redisInit()
 
 	if (redisMaster == "0") || (redisPassword == "0") {
 
@@ -60,12 +60,13 @@ func main() {
 		redisClient = redis.NewClient(&redis.Options{
 			Addr:     redisMaster,
 			Password: redisPassword,
+			TLSConfig: redisTLSConfig,
 			DB:       0, // use default DB
 		})
 
 		_, err := redisClient.Ping().Result()
 		if err != nil {
-			fmt.Printf("Failed to ping Redis: %v. Check the Redis service is running \n", err)
+			fmt.Printf("Failed to ping Redis %v:  Password: %v  Error: %v. Check the Redis service is running \n", redisMaster, redisPassword, err)
 			goapphealth = "NOTGOOD"
 		}
 	}
@@ -223,9 +224,27 @@ func getConsulKV(consulClient consul.Client, key string) string {
 	return string(appVar.Value)
 }
 
-func getConsulSVC(consulClient consul.Client, key string) (serviceDetails string, serviceConnection net.Conn) {
+func getConsulSVC(consulClient consul.Client, key string) (string, *tls.Config) {
 
+	// name of _this_ service. The service should be cleaned up via Close.
+	svc, _ := connect.NewService("my-service", &consulClient)
+	defer svc.Close()
+
+	serviceTLSConfig := svc.ServerTLSConfig()
+
+	// Connect to the "userinfo" Consul service.
+	conn, _ := svc.Dial(context.Background(), &connect.ConsulResolver{
+		Client: &consulClient,
+		Name:   key,
+	})
 	
+	if conn != nil {
+		fmt.Printf("\n\n %v \n\n", conn.LocalAddr())
+		fmt.Printf("\n\n %v \n\n", conn.RemoteAddr())
+
+		return conn.LocalAddr().String(), serviceTLSConfig
+	}
+
 	var serviceDetail strings.Builder
 	// get handle to catalog service api
 	sd := consulClient.Catalog()
@@ -238,30 +257,17 @@ func getConsulSVC(consulClient consul.Client, key string) (serviceDetails string
 	serviceDetail.WriteString(string(myService[0].Address))
 	serviceDetail.WriteString(":")
 	serviceDetail.WriteString(strconv.Itoa(myService[0].ServicePort))
-
-	fmt.Printf("\n\nGot HERE\n\n")
 	fmt.Printf(string(myService[0].ServiceName))
 	fmt.Printf(serviceDetail.String())
+	return serviceDetail.String(), nil
 
-	// name of _this_ service. The service should be cleaned up via Close.
-	svc, _ := connect.NewService("my-service", &consulClient)
-	defer svc.Close()
-
-	// Connect to the "userinfo" Consul service.
-	conn, _ := svc.Dial(context.Background(), &connect.ConsulResolver{
-		Client: &consulClient,
-		Name:   key,
-	})
-	fmt.Printf("\n\n %v \n\n", conn)
-	fmt.Printf("\n\nGot HERE finish\n\n")
-	return serviceDetail.String(), conn
 }
 
-func redisInit() (string, string, net.Conn) {
+func redisInit() (string, string, *tls.Config) {
 
 	var redisService string
 	var redisPassword string
-	var redisConnection net.Conn
+	var redisTLSConfig *tls.Config
 
 	// Get a new Consul client
 	consulClient, err := consul.NewClient(consul.DefaultConfig())
@@ -271,7 +277,7 @@ func redisInit() (string, string, net.Conn) {
 	}
 
 	redisPassword = getVaultKV("redispassword")
-	redisService, redisConnection = getConsulSVC(*consulClient, "redis")
+	redisService, redisTLSConfig  = getConsulSVC(*consulClient, "redis")
 	if redisService == "0" {
 		var serviceDetail strings.Builder
 		redisHost := getConsulKV(*consulClient, "REDIS_MASTER_IP")
@@ -282,7 +288,7 @@ func redisInit() (string, string, net.Conn) {
 		redisService = serviceDetail.String()
 	}
 
-	return redisService, redisPassword, redisConnection
+	return redisService, redisPassword, redisTLSConfig
 
 }
 
